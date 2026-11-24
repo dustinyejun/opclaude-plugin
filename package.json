@@ -1,0 +1,17 @@
+{
+  "name": "opclaude-plugin",
+  "version": "0.1.0",
+  "description": "Magpie / OpenCode provider plugin: OpusClaude through the host's local opclauded proxy",
+  "type": "module",
+  "main": "./index.mjs",
+  "files": ["index.mjs", "lib/", "README.md"],
+  "keywords": ["opencode", "opencode-plugin", "provider", "opclaude", "magpie"],
+  "engines": {"bun": ">=1.4.3"},
+  "magpie": {
+    "name": "OpusClaude 本机代理",
+    "summary": {
+      "zh": "经宿主机 opclauded 本机回环代理使用已登录的 OpusClaude（仅同主机、同系统用户）",
+      "en": "OpusClaude through the host's local opclauded loopback proxy (same host and user only)"
+    }
+  }
+}
