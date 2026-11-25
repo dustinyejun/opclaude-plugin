@@ -5,12 +5,25 @@ import { createPlugin, LOCAL_MARKER, PROVIDER } from "../lib/plugin.mjs"
 import { FAILURE_STATUS, MIN_BUN, PLACEHOLDER_BASE, assertDirectFetch, bunSupportsProxyFalse, errorBody, forward, parseModels } from "../lib/transport.mjs"
 import { runLaunch } from "../lib/launch.mjs"
 import { PROXY_PORTS, makeRig } from "./rig.mjs"
-import { existsSync, rmSync } from "node:fs"
+import { existsSync, mkdtempSync, rmSync } from "node:fs"
+import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
 import path from "node:path"
 
-let rig, hooks
-beforeAll(async () => { rig = await makeRig() })
-afterAll(async () => { await rig.close() })
+let rig, hooks, realHome, realOpusclaudeHome
+// 进程的 HOME 指向测试台：插件的子进程环境从 process.env 取 HOME / PATH，这样任何用例都碰不到当前用户的真实安装。
+beforeAll(async () => {
+  realHome = process.env.HOME
+  realOpusclaudeHome = process.env.OPUSCLAUDE_HOME
+  delete process.env.OPUSCLAUDE_HOME
+  rig = await makeRig()
+  process.env.HOME = rig.dir
+})
+afterAll(async () => {
+  process.env.HOME = realHome
+  if (realOpusclaudeHome !== undefined) process.env.OPUSCLAUDE_HOME = realOpusclaudeHome
+  await rig.close()
+})
 beforeEach(async () => {
   delete rig.st.proxyTicket
   Object.assign(rig.st, { mode: "proxy", ticket: "ticket-A-fake", device: "device-fake", delayMs: 0, status: 200, redirect: 0, hang: 0, echoError: 0, bodyDelayMs: 0, bigBody: 0, batchDelay: 0, statusText: "", openError: 0, jsonEsc: 0, echoSuccess: 0 })
@@ -19,8 +32,9 @@ beforeEach(async () => {
   rig.seen.elsewhere.length = 0
 })
 const settings = () => ({ opclauded: rig.bin, opusHome: rig.opusHome })
-const loader = async (opts, auth = { type: "api", key: LOCAL_MARKER }) => {
-  hooks = createPlugin(opts)
+// auth 省略时用默认的本地标记；env 省略时用测试台的进程环境（HOME 指向测试台）。
+const loader = async (opts, auth = { type: "api", key: LOCAL_MARKER }, env = process.env) => {
+  hooks = createPlugin(opts, { env, launcherDirs: rig.dirs })
   return await hooks.auth.loader(async () => auth)
 }
 const msg = (extra = {}) => ({ model: "claude-fable-5-2", max_tokens: 64, stream: true, messages: [{ role: "user", content: "hi" }], tools: [{ name: "get_time", description: "t", input_schema: { type: "object", properties: {} } }], ...extra })
@@ -33,7 +47,7 @@ const init = (body, extra = {}) => ({
 })
 const attempt = (p) => p.then((v) => ({ ok: true, v }), (e) => ({ ok: false, e }))
 const SECRETS = ["ticket-A-fake", "ticket-B-fake", "sk-upstream-fake", "device-fake", "SECRET-STDERR-TICKET"]
-const EXTRA_HEADERS = ["user-agent", "accept-encoding", "accept-language", "sec-fetch-mode", "content-length", "connection", "host"]
+const EXTRA_HEADERS = ["user-agent", "x-app", "accept-encoding", "accept-language", "sec-fetch-mode", "content-length", "connection", "host"]
 
 // 统计真实发往网络的请求。
 function watchFetch() {
@@ -84,15 +98,15 @@ describe("插件注册与发现", () => {
     const h = await entry.server({ client: {} }, undefined)
     expect(h.auth.provider).toBe(PROVIDER)
     expect(h.provider.id).toBe(PROVIDER)
-    expect(h.auth.methods[0].prompts.length).toBe(2)
-    // 选项写在第二参数：两个登录提示都不再出现，两个钩子照常可用
+    expect(h.auth.methods[0].prompts.length).toBe(0)
+    // 选项写在第二参数：旧的显式路径照常可用，两个钩子照常可用
     const configured = await entry.server({ client: {}, directory: "/not/options" }, { ...settings(), proxyHome: "/tmp/oc-proxy-home" })
     expect(configured.auth.methods[0].prompts.map((p) => p.key)).toEqual([])
     const ok = await configured.auth.methods[0].authorize(undefined)
     expect(ok).toMatchObject({ type: "success", key: LOCAL_MARKER })
     // 第一参数是运行环境，不会被当成选项
     const wrong = await entry.server({ opclauded: rig.bin, opusHome: rig.opusHome }, undefined)
-    expect(wrong.auth.methods[0].prompts.length).toBe(2)
+    expect(wrong.auth.methods[0].prompts.length).toBe(0)
   })
   test("config 声明原生 Anthropic 协议，不覆盖用户已有配置", async () => {
     const h = await entry.server({})
@@ -154,7 +168,7 @@ describe("插件注册与发现", () => {
 describe("模型发现的期限与体积上限", () => {
   test("期限覆盖正文读取：慢正文超时失败，流被取消，零重试", async () => {
     const { listModels } = await import("../lib/transport.mjs")
-    const state = { baseUrl: `http://127.0.0.1:${rig.port}`, credential: "ticket-A-fake", deviceId: "device-fake" }
+    const state = { baseUrl: `http://127.0.0.1:${rig.port}`, credential: "ticket-A-fake", deviceId: "device-fake", cliVersion: "2.1.284" }
     let stopped = false
     // 模拟的真实 fetch：尊重传入的 signal，中止时让正文流出错。
     const fetchImpl = async (u, i) => new Response(new ReadableStream({
@@ -191,7 +205,7 @@ describe("模型发现的期限与体积上限", () => {
   test("多字节正文按字节而不是字符计数", async () => {
     const { listModels } = await import("../lib/transport.mjs")
     // 3 字节一个汉字：按字符数只有上限的三分之一，按字节刚好超限。
-    const state = { baseUrl: `http://127.0.0.1:${rig.port}`, credential: "ticket-A-fake", deviceId: "device-fake" }
+    const state = { baseUrl: `http://127.0.0.1:${rig.port}`, credential: "ticket-A-fake", deviceId: "device-fake", cliVersion: "2.1.284" }
     let cancelled = false
     const fetchImpl = async (u, i) => new Response(new ReadableStream({
       pull(c) { c.enqueue(new TextEncoder().encode("汉".repeat(20000))) },
@@ -325,11 +339,15 @@ describe("转发", () => {
     expect(w.calls.length).toBe(0)
     expect(rig.seen.proxy.length).toBe(0)
   })
-  test("未配置路径：请求方给不了目标", async () => {
-    const l = await loader({})
-    const res = await l.fetch(URL_(), init(msg()))
-    expect(res.status).toBe(FAILURE_STATUS)
-    expect(await res.text()).toContain("[opclaude:not_configured]")
+  test("没有安装（空的 HOME）：请求方给不了目标，也没有任何请求发出", async () => {
+    const empty = await mkdtemp(path.join(tmpdir(), "opclaude-empty-"))
+    try {
+      const hooks = createPlugin({}, { env: { ...process.env, HOME: empty }, launcherDirs: [] })
+      const l = await hooks.auth.loader(async () => ({ type: "api", key: LOCAL_MARKER }))
+      const res = await l.fetch(URL_(), init(msg()))
+      expect(res.status).toBe(FAILURE_STATUS)
+      expect(await res.text()).toContain("[opclaude:launcher_not_found]")
+    } finally { await rm(empty, { recursive: true, force: true }) }
     const l3 = await loader({ opclauded: "opclauded; id", opusHome: rig.opusHome })
     expect(await (await l3.fetch(URL_(), init(msg()))).text()).toContain("[opclaude:path_invalid]")
     expect(rig.seen.proxy.length).toBe(0)
@@ -430,7 +448,7 @@ describe("转发", () => {
   })
   test("上游错误正文超过上限时换成固定错误", async () => {
     const { forward } = await import("../lib/transport.mjs")
-    const state = { baseUrl: `http://127.0.0.1:${rig.port}`, credential: "ticket-A-fake", deviceId: "device-fake" }
+    const state = { baseUrl: `http://127.0.0.1:${rig.port}`, credential: "ticket-A-fake", deviceId: "device-fake", cliVersion: "2.1.284" }
     const fetchImpl = async () => new Response("x".repeat(70000), { status: 500 })
     const r = await forward({ input: URL_(), init: init(msg()), state, fetchImpl })
     expect(await r.text()).toContain("[opclaude:upstream_error]")
@@ -458,7 +476,7 @@ describe("转发", () => {
     expect(r.headers.get("retry-after")).toBe("7")
   })
   test("上游错误正文到期：切断读取并释放流，及时返回固定错误，保留状态码与 Retry-After", async () => {
-    const state = { baseUrl: `http://127.0.0.1:${rig.port}`, credential: "ticket-A-fake", deviceId: "device-fake" }
+    const state = { baseUrl: `http://127.0.0.1:${rig.port}`, credential: "ticket-A-fake", deviceId: "device-fake", cliVersion: "2.1.284" }
     let cancelled = 0
     const encoder = new TextEncoder()
     const stream = new ReadableStream({ start(c) { c.enqueue(encoder.encode('{"type":"error","error":{"type":"rate_limit_error","message":"slow')) }, cancel() { cancelled += 1 } })
@@ -474,7 +492,7 @@ describe("转发", () => {
     expect(rig.seen.proxy.length).toBe(0)
   })
   test("读上游错误正文时调用方取消：中断读取、释放流，并原样传播取消原因", async () => {
-    const state = { baseUrl: `http://127.0.0.1:${rig.port}`, credential: "ticket-A-fake", deviceId: "device-fake" }
+    const state = { baseUrl: `http://127.0.0.1:${rig.port}`, credential: "ticket-A-fake", deviceId: "device-fake", cliVersion: "2.1.284" }
     let cancelled = 0
     const stream = new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode('{"type":"error"')) }, cancel() { cancelled += 1 } })
     const fetchImpl = async () => new Response(stream, { status: 429 })
@@ -497,12 +515,16 @@ describe("转发", () => {
     const r = await l.fetch(req)
     expect(r.status).toBe(200)
     expect(rig.seen.proxy.at(-1).headers).toContain("anthropic-version")
-    expect(rig.seen.proxy.at(-1).app).toBe("request-object")
+    // 请求方自带的 x-app 不外发：统一是 cli
+    expect(rig.seen.proxy.at(-1).app).toBe("cli")
+    expect(rig.seen.proxy.at(-1).ua).toBe("claude-cli/2.1.284 (external, cli)")
     expect(rig.seen.proxy.at(-1).model).toBe("claude-sonnet-5-5")
     expect(JSON.parse(rig.seen.body).messages[0].content).toBe("hi")
     // init 覆盖 Request 的对应项
-    const r2 = await l.fetch(req, { headers: { ...headers, "x-app": "from-init" }, body: JSON.stringify(msg({ stream: false, model: "claude-fable-5-2" })) })
-    expect(rig.seen.proxy.at(-1).app).toBe("from-init")
+    const r2 = await l.fetch(req, { headers: { ...headers, "x-app": "from-init", "x-init-marker": "1" }, body: JSON.stringify(msg({ stream: false, model: "claude-fable-5-2" })) })
+    // init 的头确实生效（x-init-marker 到达代理）；x-app 始终是宿主机口径
+    expect(rig.seen.proxy.at(-1).app).toBe("cli")
+    expect(rig.seen.proxy.at(-1).headers).toContain("x-init-marker")
     expect(rig.seen.proxy.at(-1).model).toBe("claude-fable-5-2")
   })
   test("标准 Request 用原生合并语义：init 的头整体替换，init 的信号替换旧信号", async () => {
@@ -549,7 +571,9 @@ describe("转发", () => {
     })
     const inherited = Object.create({ headers: { "content-type": "application/json", "x-app": "inherited" } })
     expect((await l.fetch(request(), inherited)).status).toBe(200)
-    expect(rig.seen.proxy.at(-1).app).toBe("inherited")
+    // 原型上的头也按 init.headers 读取（content-type 到达代理）；x-app 仍是宿主机口径
+    expect(rig.seen.proxy.at(-1).headers).toContain("content-type")
+    expect(rig.seen.proxy.at(-1).app).toBe("cli")
     expect(rig.seen.proxy.at(-1).headers).not.toContain("anthropic-beta")
 
     const reason = new Error("cancelled through non-enumerable init")
@@ -593,7 +617,7 @@ describe("转发", () => {
     expect(await r.text()).toContain("end_turn")
     // 状态文本：Bun.serve 发出的原因短语固定是 OK，所以用注入的上游响应验证
     const { forward } = await import("../lib/transport.mjs")
-    const state = { baseUrl: `http://127.0.0.1:${rig.port}`, credential: "ticket-A-fake", deviceId: "device-fake" }
+    const state = { baseUrl: `http://127.0.0.1:${rig.port}`, credential: "ticket-A-fake", deviceId: "device-fake", cliVersion: "2.1.284" }
     const fetchImpl = async () => new Response("data: {\"type\":\"message_stop\"}\n\n", { status: 200, statusText: `ok ticket-A-fake`, headers: { "content-type": "text/event-stream", "x-echo-ticket": "Bearer ticket-A-fake", "x-device": "device-fake", "x-keep": "yes" } })
     const direct = await forward({ input: URL_(), init: init(msg()), state, fetchImpl })
     expect(direct.status).toBe(200)
@@ -727,7 +751,7 @@ describe("转发", () => {
     expect(rig.seen.proxy.length).toBe(before)
     // 2. 取得运行态之后、发请求之前取消：launch 已跑，模型请求零次
     const { listModels } = await import("../lib/transport.mjs")
-    const state = { baseUrl: `http://127.0.0.1:${rig.port}`, credential: "ticket-A-fake", deviceId: "device-fake" }
+    const state = { baseUrl: `http://127.0.0.1:${rig.port}`, credential: "ticket-A-fake", deviceId: "device-fake", cliVersion: "2.1.284" }
     let asked = 0
     const late = await attempt(listModels({ state, signal: dead.signal, fetchImpl: async () => { asked += 1; return new Response("{}") } }))
     expect(late.ok).toBe(false)
@@ -802,7 +826,7 @@ describe("转发", () => {
   })
   test("代理响应到达时已取消，释放正文并保留显式 null", async () => {
     const { listModels } = await import("../lib/transport.mjs")
-    const state = { baseUrl: `http://127.0.0.1:${rig.port}`, credential: "ticket-A-fake", deviceId: "device-fake" }
+    const state = { baseUrl: `http://127.0.0.1:${rig.port}`, credential: "ticket-A-fake", deviceId: "device-fake", cliVersion: "2.1.284" }
     for (const status of [200, 429]) {
       const caller = new AbortController()
       let cancelled = false
@@ -840,7 +864,7 @@ describe("转发", () => {
     expect(generated.e).toBeNull()
     expect(existsSync(stamp)).toBe(false)
 
-    const state = { baseUrl: `http://127.0.0.1:${rig.port}`, credential: "ticket-A-fake", deviceId: "device-fake" }
+    const state = { baseUrl: `http://127.0.0.1:${rig.port}`, credential: "ticket-A-fake", deviceId: "device-fake", cliVersion: "2.1.284" }
     const models = await attempt(listModels({ state, signal }))
     expect(models.ok).toBe(false)
     expect(models.e).toBeNull()

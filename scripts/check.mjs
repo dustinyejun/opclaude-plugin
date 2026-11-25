@@ -1,5 +1,7 @@
-// 按 Magpie 的方式从目录加载本包，检查入口形状与各钩子（不发任何网络请求）。
+// 按 Magpie 的方式从目录加载本包，检查入口形状与各钩子。请求只发到测试台自己起的回环 mock 代理。
 // 用法（需要 Bun >= 1.4.3）："$MAGPIE_BUN" scripts/check.mjs [包目录]
+import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
 
@@ -12,65 +14,104 @@ if (!bunSupportsProxyFalse()) {
   process.exit(2)
 }
 
-const entry = await import(pathToFileURL(path.join(dir, pkg.main)).href)
+// 整个检查在隔离的进程环境里做：HOME 指向一个空目录，不带 OPUSCLAUDE_HOME，
+// 不会去看运行检查的用户自己机器上的 opclaude 安装，也不读任何真实配置。
+const realHome = process.env.HOME
+const emptyHome = await mkdtemp(path.join(tmpdir(), "opclaude-check-empty-"))
+const { createPlugin } = await import(pathToFileURL(path.join(dir, "lib/plugin.mjs")).href)
+const { makeRig } = await import(pathToFileURL(new URL("../test/rig.mjs", import.meta.url).pathname).href)
+try {
+  process.env.HOME = emptyHome
+  delete process.env.OPUSCLAUDE_HOME
 
-// 与 Magpie 宿主一致：default.server，或导出的函数，或带 server 的对象。
-const found = []
-if (entry.default && typeof entry.default.server === "function") found.push(["default.server", entry.default.server])
-for (const [name, v] of Object.entries(entry)) {
-  if (name === "default") continue // 上面已按 default.server 处理
-  if (typeof v === "function") found.push([name, v])
-  else if (v && typeof v === "object" && typeof v.server === "function") found.push([name, v.server])
-}
+  const entry = await import(pathToFileURL(path.join(dir, pkg.main)).href)
 
-const fail = (m) => { console.error("✗ " + m); process.exitCode = 1 }
-const ok = (m) => console.log("✓ " + m)
+  // 与 Magpie 宿主一致：default.server，或导出的函数，或带 server 的对象。
+  const found = []
+  if (entry.default && typeof entry.default.server === "function") found.push(["default.server", entry.default.server])
+  for (const [name, v] of Object.entries(entry)) {
+    if (name === "default") continue // 上面已按 default.server 处理
+    if (typeof v === "function") found.push([name, v])
+    else if (v && typeof v === "object" && typeof v.server === "function") found.push([name, v.server])
+  }
 
-if (pkg.name !== "opclaude-plugin") fail(`package.json name 应为 opclaude-plugin，实际 ${pkg.name}`)
-else ok(`包名 ${pkg.name}@${pkg.version}，入口 ${pkg.main}`)
-if (found.length !== 1) fail(`应当只导出一个插件函数，实际 ${found.length} 个：${found.map((f) => f[0])}`)
-const [label, fn] = found[0] ?? []
-if (typeof fn !== "function") process.exit(1)
-// Magpie 以 server(input, options) 调用：选项在第二参数。
-const hooks = await fn({ client: {} }, undefined)
-ok(`作为插件加载：${label} -> hooks ${Object.keys(hooks).join(", ")}`)
+  const fail = (m) => { console.error("✗ " + m); process.exitCode = 1 }
+  const ok = (m) => console.log("✓ " + m)
+  const isRefusal = async (res, code) => res.status === 400 && (await res.text()).includes(`[opclaude:${code}]`)
 
-if (hooks.auth?.provider !== "opclaude") fail("auth.provider 应为 opclaude")
-else ok("auth.provider = opclaude")
-if (hooks.provider?.id !== "opclaude") fail("provider.id 应为 opclaude")
-if (typeof hooks.auth?.loader !== "function") fail("缺少 auth.loader")
-if (typeof hooks.provider?.models !== "function") fail("缺少 provider.models")
-const method = hooks.auth?.methods?.[0]
-if (!method) fail("缺少登录方式")
-else ok(`登录方式 ${hooks.auth.methods.length} 个：${method.type}，未配置路径时询问 ${method.prompts.length} 项`)
+  if (pkg.name !== "opclaude-plugin") fail(`package.json name 应为 opclaude-plugin，实际 ${pkg.name}`)
+  else ok(`包名 ${pkg.name}@${pkg.version}，入口 ${pkg.main}`)
+  if (found.length !== 1) fail(`应当只导出一个插件函数，实际 ${found.length} 个：${found.map((f) => f[0]).join(", ")}`)
+  const [label, fn] = found[0] ?? []
+  if (typeof fn !== "function") process.exit(1)
+  // Magpie 以 server(input, options) 调用：选项在第二参数。
+  const hooks = await fn({ client: {} }, undefined)
+  ok(`作为插件加载：${label} -> hooks ${Object.keys(hooks).join(", ")}`)
 
-const cfg = {}
-await hooks.config(cfg)
-const p = cfg.provider?.opclaude
-if (p?.npm !== "@ai-sdk/anthropic") fail("config 应声明 npm @ai-sdk/anthropic（原生 Anthropic Messages）")
-else ok(`config 声明 provider opclaude：npm ${p.npm}，api ${p.api}`)
+  if (hooks.auth?.provider !== "opclaude") fail("auth.provider 应为 opclaude")
+  else ok("auth.provider = opclaude")
+  if (hooks.provider?.id !== "opclaude") fail("provider.id 应为 opclaude")
+  if (typeof hooks.auth?.loader !== "function") fail("缺少 auth.loader")
+  if (typeof hooks.provider?.models !== "function") fail("缺少 provider.models")
+  const method = hooks.auth?.methods?.[0]
+  if (!method) fail("缺少登录方式")
+  else if (method.prompts.length !== 0) fail(`登录不应询问任何 OpusClaude 信息，实际询问 ${method.prompts.length} 项`)
+  else ok(`登录方式 ${hooks.auth.methods.length} 个：${method.type}，不询问路径 / 密钥 / 版本（提示 0 项）`)
 
-const l = await hooks.auth.loader(async () => undefined)
-if (l.baseURL !== p.api || typeof l.fetch !== "function") fail("loader 应返回占位 baseURL 与 fetch")
-else ok(`loader 返回 baseURL ${l.baseURL} 与 fetch`)
+  const cfg = {}
+  await hooks.config(cfg)
+  const p = cfg.provider?.opclaude
+  if (p?.npm !== "@ai-sdk/anthropic") fail("config 应声明 npm @ai-sdk/anthropic（原生 Anthropic 协议）")
+  else ok(`config 声明 provider opclaude：npm ${p.npm}，api ${p.api}`)
 
-// 未配置时的失败应当是可交付的 Anthropic 错误：状态码 + 固定错误码，不含任何敏感内容。
-const res = await l.fetch(p.api + "/messages", { method: "POST", headers: {}, body: "{}" })
-const body = await res.text()
-if (res.status !== 400 || !body.includes("[opclaude:not_configured]")) fail(`未配置时应返回 400 与 not_configured，实际 ${res.status} ${body.slice(0, 120)}`)
-else ok("未配置时返回 400 Anthropic 错误：not_configured")
+  const l = await hooks.auth.loader(async () => undefined)
+  if (l.baseURL !== p.api || typeof l.fetch !== "function") fail("loader 应返回占位 baseURL 与 fetch")
+  else ok(`loader 返回 baseURL ${l.baseURL} 与 fetch`)
 
-// 选项写在第二参数时，登录不再询问路径。
-const tmp = await makeTmp()
-const configured = await fn({ client: {} }, { opclauded: path.join(tmp, "missing"), opusHome: tmp })
-if (configured.auth.methods[0].prompts.length !== 0) fail("已配置路径时登录不应再询问")
-else ok("选项已给出路径时，登录不再询问（提示 0 项）")
-const refused = await configured.auth.methods[0].authorize(undefined)
-if (refused.type !== "failed" || !String(refused.error).includes("opclauded")) fail("登录应真实校验并给出失败原因")
-else ok(`登录校验生效：${refused.error}`)
+  // 没有安装：失败应当是可交付的 Anthropic 错误，状态码 + 固定错误码。
+  // 这里用注入的空查找位置：入口函数默认还会去看 /usr/local/bin/opclaude，那是运行检查的机器上真实的安装。
+  const post = (extra = {}) => ({ method: "POST", headers: { "content-type": "application/json", "user-agent": "claude-cli/0.0.1 (external, cli)", "x-app": "caller" }, body: JSON.stringify({ model: "claude-fable-5-2", max_tokens: 16, messages: [{ role: "user", content: "hi" }] }), ...extra })
+  const bare = await createPlugin({}, { launcherDirs: [] }).auth.loader(async () => undefined)
+  if (await isRefusal(await bare.fetch(p.api + "/messages", post()), "launcher_not_found")) ok("没有安装时返回 400 Anthropic 错误：launcher_not_found")
+  else fail("没有安装时应返回 400 与 launcher_not_found")
 
-async function makeTmp() {
-  const d = await Bun.$`mktemp -d`.text()
-  return d.trim()
+  // 模拟安装：默认流程不需要任何选项或登录输入。
+  const rig = await makeRig()
+  try {
+    const loaded = createPlugin(undefined, { env: rig.env, launcherDirs: rig.dirs, systemClaudes: rig.claudes })
+    if (loaded.auth.methods[0].prompts.length !== 0) fail("登录不应有提示项")
+    const signedIn = await loaded.auth.methods[0].authorize(undefined)
+    if (signedIn.type === "success" && Object.keys(signedIn.metadata).length === 0) ok(`登录不询问、不保存路径：key=${signedIn.key}，metadata={}`)
+    else fail(`登录应当成功且不保存元数据，实际 ${JSON.stringify(signedIn)}`)
+    const fetch = (await loaded.auth.loader(async () => signedIn)).fetch
+    const res = await fetch(p.api + "/messages", post())
+    const ua = rig.seen.proxy.at(-1)?.ua
+    if (res.status === 200 && ua === "claude-cli/2.1.284 (external, cli)" && rig.seen.proxy.at(-1)?.app === "cli") ok("请求经本机代理：入站 UA / x-app 被换成宿主机版本 claude-cli/2.1.284 (external, cli) 与 cli")
+    else fail(`经模拟安装的请求应成功并带宿主机版本头，实际 ${res.status} ua=${ua}`)
+
+    // 旧的显式配置：成对时照旧；只给一半时拒绝，不与自动发现的结果拼在一起。
+    const half = await createPlugin({}, { env: rig.env, launcherDirs: rig.dirs, systemClaudes: rig.claudes }).auth.methods[0].authorize({ opclauded: rig.bin })
+    if (half.type === "failed" && String(half.error).includes("[opclaude:legacy_incomplete")) ok("半缺的旧设置被拒绝：legacy_incomplete")
+    else fail(`只给 opclauded 时应返回 legacy_incomplete，实际 ${JSON.stringify(half)}`)
+    // 成对时照旧按显式路径执行（不换成启动器选定的程序），启动器须属于显式给出的那个安装；程序不在就照实报 binary_missing。
+    const legacyFetch = await createPlugin({ opclauded: rig.bin, opusHome: rig.opusHome }, { env: rig.env, launcherDirs: rig.dirs, systemClaudes: rig.claudes }).auth.loader(async () => ({ type: "api", key: signedIn.key }))
+    const legacyRes = await legacyFetch.fetch(p.api + "/messages", post())
+    if (legacyRes.status === 200 && rig.seen.proxy.at(-1)?.ua === ua) ok("成对的旧设置照旧按显式路径执行，同样带宿主机版本头")
+    else fail(`成对的旧设置应按显式路径执行，实际 ${legacyRes.status}`)
+    const gone = await createPlugin({ opclauded: path.join(rig.opusHome, "opclauded", "0.0.1-missing", "opclauded"), opusHome: rig.opusHome }, { env: rig.env, launcherDirs: rig.dirs, systemClaudes: rig.claudes }).auth.methods[0].authorize(undefined)
+    if (gone.type === "failed" && String(gone.error).includes("[opclaude:binary_missing]")) ok("显式路径的程序不在：binary_missing")
+    else fail(`显式路径的程序不在时应返回 binary_missing，实际 ${JSON.stringify(gone)}`)
+    // 三个出站路径（请求、count_tokens、GET /v1/models）带同一套宿主机标识。
+    const countTokens = await fetch(p.api + "/messages/count_tokens", { ...post(), body: JSON.stringify({ model: "claude-sonnet-5-5", messages: [{ role: "user", content: "hi" }] }) })
+    const catalog = await createPlugin(undefined, { env: rig.env, launcherDirs: rig.dirs, systemClaudes: rig.claudes }).provider.models({ models: {} }, { auth: { type: "api", key: signedIn.key } })
+    const tail = rig.seen.proxy.slice(-2)
+    if (countTokens.status === 200 && Object.keys(catalog).length > 0 && tail.every((r) => r.ua === ua && r.app === "cli" && r.authed) && tail.at(-1).path === "/v1/models") ok("count_tokens 与 GET /v1/models 也带宿主机版本头与 cli")
+    else fail(`count_tokens / 模型发现应带宿主机版本头，实际 ${JSON.stringify(tail)}`)
+  } finally {
+    await rig.close()
+  }
+} finally {
+  process.env.HOME = realHome
+  await rm(emptyHome, { recursive: true, force: true })
 }
 console.log(process.exitCode ? "检查未通过" : "全部通过")

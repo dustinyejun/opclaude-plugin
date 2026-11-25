@@ -89,8 +89,8 @@ describe("设置与可执行文件校验", () => {
     delete process.env.ANTHROPIC_AUTH_TOKEN
     expect(await Bun.file(path.join(rig.state, "last-args")).text()).toBe(`--home|${rig.opusHome}|--min-protocol|1\n`)
     const env = (await Bun.file(path.join(rig.state, "last-env")).text()).split("\n")
-    expect(env).toContain("OPCLAUDE_PROXY_HOME=/tmp/oc-proxy-home".split("=")[0])
-    expect(env.some((k) => /ANTHROPIC|OPUSCLAUDE|CLAUDE|OC_/.test(k) && k !== "OPCLAUDE_PROXY_HOME")).toBe(false)
+    expect(env.includes("OPCLAUDE_PROXY_HOME")).toBe(true)
+    expect(env.filter((k) => k !== "OPCLAUDE_PROXY_HOME").join(",")).not.toMatch(/ANTHROPIC|OPUSCLAUDE|CLAUDE|OC_/)
   })
   test("opclauded 的各类失败都给出安全错误码，stderr 原文不外传", async () => {
     for (const [mode, c] of [["direct", "mode_direct"], ["badport", "base_url_rejected"], ["localhost", "base_url_rejected"], ["public", "base_url_rejected"], ["garbage", "launch_output_invalid"], ["inject", "launch_output_invalid"], ["dup", "launch_output_invalid"], ["crlf", "launch_output_invalid"], ["nocred", "launch_output_invalid"], ["credctl", "launch_output_invalid"], ["other", "mode_unsupported"], ["huge", "launch_output_invalid"], ["busy", "install_busy"], ["txn", "txn_recovery_failed"], ["proto", "launch_failed"], ["zzz", "launch_failed"]]) {

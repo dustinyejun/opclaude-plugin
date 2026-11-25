@@ -10,12 +10,12 @@ try {
   const control = await fetch(`http://127.0.0.1:${rig.port}/v1/models`)
   out.control = control.status
   await control.text()
-  const l = await createPlugin({ opclauded: rig.bin, opusHome: rig.opusHome }).auth.loader(async () => ({ type: "api", key: "local" }))
+  const l = await createPlugin({}, { env: rig.env, launcherDirs: rig.dirs }).auth.loader(async () => ({ type: "api", key: "local" }))
   const r = await l.fetch("http://127.0.0.1:1/v1/messages", { method: "POST", body: JSON.stringify({ model: "claude-sonnet-5-5", stream: false, messages: [] }) })
   out.forward = r.status
   out.proxyRequests = rig.seen.proxy.length
-  const hooks = createPlugin({ opclauded: rig.bin, opusHome: rig.opusHome })
-  out.models = Object.keys(await hooks.provider.models({ models: {} }, {})).length
+  const hooks = createPlugin({}, { env: rig.env, launcherDirs: rig.dirs })
+  out.models = Object.keys(await hooks.provider.models({ models: {} }, { auth: { type: "api", key: "local" } })).length
 } catch (e) {
   out.error = String(e?.message ?? e)
 } finally {

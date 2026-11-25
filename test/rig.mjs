@@ -1,6 +1,13 @@
-// 测试台：假的 opclauded（bash 脚本）+ 本机回环 mock 代理。只用模拟票据，不碰任何真实凭据。
-import { chmod, mkdir, mkdtemp, writeFile } from "node:fs/promises"
-import { tmpdir } from "node:os"
+// 测试台：假的 opclauded（bash 脚本）+ 仿官方 opclaude 启动器 + 假的 claude + 本机回环 mock 代理。
+// 只用模拟票据，不碰任何真实凭据。
+//
+// 目录布局对应真实安装（dir 充当“系统用户”的 home）：
+//   <dir>/.opusclaude/opclauded/0.5.1-test/opclauded   假的 opclauded，启动器里写死的就是这个路径
+//   <dir>/state/                                        运行态（mode / ticket / port / ccVersion …）
+//   <userHome>/.local/bin/opclaude                      仿官方启动器，userHome 省略时就是 dir
+//   <userHome>/.local/bin/claude                        假的 claude，--version 读 state/ccVersion
+import { access, chmod, mkdir, mkdtemp, realpath, rm, stat, writeFile } from "node:fs/promises"
+import { homedir, tmpdir } from "node:os"
 import path from "node:path"
 import { MIN_BUN, bunSupportsProxyFalse } from "../lib/transport.mjs"
 
@@ -11,15 +18,24 @@ if (!bunSupportsProxyFalse()) {
 }
 
 export const PROXY_PORTS = Array.from({ length: 10 }, (_, i) => 18827 + i)
+export const OPCLOUDED_VERSION = "0.5.1-test"
+export const DEFAULT_CC_VERSION = "2.1.284"
 
 const FAKE = `#!/bin/bash
-d="$(cd "$(dirname "$0")/.." && pwd)/state"
+d="$(cd "$(dirname "$0")/../../.." && pwd)/state"
+# 真正的 opclauded 以 --home 为准（插件运行的是它的内容绑定副本，位置不在安装里）；没有可用的 --home 时才按自己的位置往上找三级。
+if [ "$2" = --home ] && [ -d "$3" ]; then d="$(cd "$3/.." && pwd)/state"; fi
+# 自定位：从自己所在位置往上两级，与安装里 opclauded/<版本>/opclauded 的层次一致。
+_oc_l="$(cd "$(dirname "$0")/../.." && pwd)"; printf '%s\n' "\${_oc_l##*/}" > "$d/launched-layout"
 mode="$(cat "$d/mode" 2>/dev/null || echo proxy)"
 if [ "$1" != launch ] || [ "$2" != --home ] || [ "$4" != --min-protocol ] || [ "$5" != 1 ]; then
   printf 'usage\\n' >&2; exit 64
 fi
 printf '%s|%s|%s|%s\\n' "$2" "$3" "$4" "$5" > "$d/last-args"
+printf '%s\\n' "$0" > "$d/launched-bin"
+printf '%s\\n' "\${OPCLAUDE_PROXY_HOME:-}" > "$d/proxy-home"
 env | cut -d= -f1 | sort > "$d/last-env"
+printf '%s\\n' "$2 $3" > "$d/launch-home"
 port="$(cat "$d/port")"
 line() { printf '%s\\n' "$1"; }
 case "$mode" in
@@ -76,6 +92,91 @@ export const SSE_BATCHES = [
 ]
 const SSE = SSE_BATCHES.flat().join("")
 
+// 仿官方启动器：只保留与发现、版本有关的段落，函数与安装脚本的启动器逐字相同，
+// 版本行的格式也相同（"Claude Code：<实际版本>（推荐 <钉死版本>）"）。字面量写成双引号，与安装器一致。
+const LAUNCHER_SOURCE = `#!/bin/sh
+# OpusClaude 启动器（测试替身）：Claude Code 定位与版本函数同官方安装脚本。
+set -eu
+OPUS_DIR="\${OPUSCLAUDE_HOME:-$HOME/.opusclaude}"
+CONFIG="$OPUS_DIR/config"
+OPCLAUDED_BIN="__OPUSCLAUDE_PROXY_BIN__"
+OPCLAUDED_SHA256="__OPUSCLAUDE_PROXY_SHA__"   # 装机时核对过的代理程序指纹；对不上就不执行它
+CLAUDE_ENV_DIR="$OPUS_DIR/claude-env"   # opclaude 专属 Claude 配置根（CLAUDE_CONFIG_DIR）
+mkdir -p "$CLAUDE_ENV_DIR" 2>/dev/null || true
+export PATH="$HOME/.local/bin:\${PATH:-}"
+CLAUDE_PIN="2.1.284"
+oc_claude_candidates(){
+  _oc_seen="|"
+  _oc_npmd="$(command -v npm 2>/dev/null || true)"
+  case "$_oc_npmd" in /*) _oc_npmd="\${_oc_npmd%/*}/claude" ;; *) _oc_npmd="" ;; esac
+  for _p in \\
+    "$HOME/.local/bin/claude" \\
+    "$HOME/.claude/local/claude" \\
+    "__OPUSCLAUDE_SYS_CLAUDE_1__" \\
+    "__OPUSCLAUDE_SYS_CLAUDE_2__" \\
+    "$(command -v claude 2>/dev/null || true)" \\
+    "$HOME/.local/share/claude/versions/\${CLAUDE_PIN:-none}" \\
+    "$HOME/.npm-global/bin/claude" \\
+    "$_oc_npmd"
+  do
+    [ -n "$_p" ] || continue
+    [ -x "$_p" ] || continue
+    [ -f "$_p" ] || [ -L "$_p" ] || continue
+    case "$_p" in */Claude.app/*) continue ;; esac
+    case "$_oc_seen" in *"|$_p|"*) continue ;; esac
+    _oc_seen="$_oc_seen$_p|"
+    printf '%s\\n' "$_p"
+  done
+  return 0
+}
+resolve_claude_bin(){
+  _oc_all="$(oc_claude_candidates)"
+  [ -n "$_oc_all" ] || return 1
+  printf '%s\\n' "$_oc_all" | sed -n '1p'
+}
+claude_version(){
+  _oc_b="\${1:-}"
+  [ -n "$_oc_b" ] || return 0
+  "$_oc_b" --version </dev/null 2>/dev/null | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+' | head -1 || true
+}
+if [ "\${1:-}" = version ]; then
+  { env | cut -d= -f1 | sort > "$OPUS_DIR/launcher-env"; } 2>/dev/null || true
+  printf '%s\\n' "$PATH" > "$OPUS_DIR/launcher-path"
+  printf '%s\\n' "$PWD" > "$OPUS_DIR/launcher-cwd"
+  printf '%s\\n' "$0" > "$OPUS_DIR/launcher-argv0"
+  printf '%s\\n' "\${OPUSCLAUDE_HOME:-}" > "$OPUS_DIR/launcher-home"
+  printf 'OpusClaude 接入包：%s\\n' "20261120.1"
+  _v_cc=$(claude_version "$(resolve_claude_bin || true)")
+  printf 'Claude Code：%s（推荐 %s）\\n' "\${_v_cc:-未找到}" "$CLAUDE_PIN"
+  if [ -n "$OPCLAUDED_BIN" ]; then
+    printf '本地代理：opclauded %s\\n' "$(basename "$(dirname "$OPCLAUDED_BIN")")"
+  else
+    printf '本地代理：未启用（直连）\\n'
+  fi
+  exit 0
+fi
+printf 'interactive launch is not available in the test stand-in\\n' >&2
+exit 1
+`
+
+// 假的 claude：--version 的输出形如官方的 "2.1.284 (Claude Code)"。实际版本取自 state/ccVersion，
+// 所以“宿主升级”只需要改这个文件，启动器不用动。其它子命令（status / update / 交互启动）记录后报错。
+// ccVersion 为 missing（或读不到）时直接失败、不输出：模拟“这份 claude 跑不起来”。
+// hang：--version 一直不结束；late：--version 挂 2 秒后写出完成标记 claude-late（用来确认超时 / 取消之后它确实没再运行）。
+// 每次 --version 都把工作目录记到 claude-cwd。
+// 注意不要删掉这个文件：启动器的候选顺序后面是 /opt/homebrew/bin/claude、/usr/local/bin/claude 等真实位置。
+const CLAUDE = `#!/bin/sh
+d="__STATE__"
+printf '%s\\n' "$*" >> "$d/claude-args"
+printf '%s\\n' "$PWD" > "$d/claude-cwd"
+printf '%s\\n' "$PATH" > "$d/claude-path"
+env | cut -d= -f1 | sort > "$d/claude-env"
+case "$*" in
+  --version) v="$(cat "$d/ccVersion" 2>/dev/null)"; case "$v" in ""|missing) exit 1 ;; broken) printf 'unknown build\\n' ;; hang) sleep 30 ;; late) sleep 2; printf done > "$d/claude-late" ;; *) printf '%s (Claude Code)\\n' "$v" ;; esac; exit 0 ;;
+esac
+exit 1
+`
+
 const encoder = new TextEncoder()
 const sleep = (ms) => (ms ? Bun.sleep(ms) : Promise.resolve())
 
@@ -106,20 +207,89 @@ function bigBody(size, delayMs) {
 }
 
 // dir 省略时建临时目录，scripts/mock-host.mjs 传入固定目录，供真实 Magpie 沙箱验证使用。
-export async function makeRig({ dir = "" } = {}) {
-  dir = dir || await mkdtemp(path.join(tmpdir(), "opclaude-rig-"))
+// dir 充当“系统用户”的 home，布局与真实安装一致：
+//   <dir>/.opusclaude/                    OpusClaude home（默认位置）
+//   <dir>/.local/bin/{opclaude,claude}    启动器与假的 claude
+//   <dir>/state/                          测试台的运行态与记录
+// launcherHome 可把启动器与假 claude 放到另一个用户目录（模拟另设 OPUSCLAUDE_HOME）。
+// 别的用户进得来的临时目录（macOS / Linux 的 /tmp：root 所有、带 sticky 位）。权限类用例的沙箱要建在这里：
+// 系统临时目录（macOS 的 /var/folders/…）本身是本用户 0700 的私有目录，里面的东西别的用户根本够不着，
+// 插件据此接受其中组可写、所有人可写的目录项，在那里测不出“别的用户能改动”。
+export async function sharedTmp() {
+  try {
+    if ((await stat("/tmp")).mode & 0o001 && (await access("/tmp", 2 /* W_OK */).then(() => true, () => false))) return "/tmp"
+  } catch {}
+  return tmpdir()
+}
+
+// private=true：dir 保持 mkdtemp 的 0700，当作“上级有私有目录”的安装位置；否则沙箱目录是 0755。
+export async function makeRig({ dir = "", launcherHome = "", private: privateDir = false } = {}) {
+  const own = !dir
+  dir = path.resolve(dir || await mkdtemp(path.join(await sharedTmp(), "opclaude-rig-")))
+  if (own && !privateDir) await chmod(dir, 0o755)
+  // 测试台会往 <dir>/.local/bin 与 <dir>/.opusclaude 写文件。dir 等于 $HOME 时只允许它是系统临时目录之下的沙箱
+  // （真实 Magpie 的端到端验证这样做），绝不指向用户自己真实使用的 home。
+  if (dir === path.resolve(homedir()) && !(await realpath(dir)).startsWith((await realpath(tmpdir())) + path.sep) && !(await realpath(dir)).startsWith((await realpath("/tmp")) + path.sep)) throw new Error("refusing to build the test rig in the real user home")
+  launcherHome = launcherHome || dir
+  const opusHome = path.join(dir, ".opusclaude")
   const state = path.join(dir, "state")
-  await mkdir(path.join(dir, "bin"), { recursive: true })
+  await mkdir(path.join(opusHome, "opclauded", OPCLOUDED_VERSION), { recursive: true })
   await mkdir(state, { recursive: true })
-  const bin = path.join(dir, "bin", "opclauded")
+  const bin = path.join(opusHome, "opclauded", OPCLOUDED_VERSION, "opclauded")
   if (!process.env.OC_RIG_KEEP_BIN) await writeFile(bin, FAKE)
   await chmod(bin, 0o755)
+
+  const claudes = [path.join(dir, "opt-homebrew", "bin", "claude"), path.join(dir, "usr-local", "bin", "claude")]
+  // 写一份仿官方安装：启动器 + 假 claude。text 可替换启动器正文（故障注入），sha256 可把指纹改成错的。
+  const install = async ({ home = launcherHome, text = "", sha256 = "" } = {}) => {
+    const binDir = path.join(home, ".local", "bin")
+    await mkdir(binDir, { recursive: true })
+    const sum = sha256 || new Bun.CryptoHasher("sha256").update(new Uint8Array(await Bun.file(bin).arrayBuffer())).digest("hex")
+    const body = (text || LAUNCHER_SOURCE)
+      .replaceAll("__OPUSCLAUDE_PROXY_BIN__", bin)
+      .replaceAll("__OPUSCLAUDE_PROXY_SHA__", sum)
+      .replaceAll("__OPUSCLAUDE_SYS_CLAUDE_1__", claudes[0])
+      .replaceAll("__OPUSCLAUDE_SYS_CLAUDE_2__", claudes[1])
+    const launcher = path.join(binDir, "opclaude")
+    await Bun.write(launcher, body)
+    await chmod(launcher, 0o755)
+    await writeConfig(new Bun.CryptoHasher("sha256").update(body).digest("hex"))
+    await Bun.write(path.join(binDir, "claude"), CLAUDE.replaceAll("__STATE__", state))
+    await chmod(path.join(binDir, "claude"), 0o755)
+    return { launcher, sum }
+  }
+  // 仿官方安装器写出的 <home>/config：chmod 600，带一项假的票据，以及成品启动器的摘要 LAUNCHER_SHA。
+  const config = path.join(opusHome, "config")
+  const writeConfig = async (launcherSha, extra = "") => {
+    await Bun.write(config, [
+      "# OpusClaude 接入配置（自动生成，勿手改；chmod 600；卸载：install.sh --uninstall）",
+      "ANTHROPIC_AUTH_TOKEN='ticket-config-fake'",
+      "GATEWAY='https://api.opusapi.xyz'",
+      "DEVICE_ID='device-fake'",
+      "LAUNCHER_SHA='" + launcherSha + "'",
+      "CLI_PKG_VERSION='20261120.1'",
+      "OPCLAUDE_PROXY='1'",
+      extra,
+    ].join("\n") + "\n")
+    await chmod(config, 0o600)
+  }
+  // 把假的 opclauded 恢复成原始内容与权限，并重写启动器（故障注入的用例之后调用）。
+  const restore = async () => {
+    await mkdir(path.dirname(bin), { recursive: true })
+    await writeFile(bin, FAKE)
+    await chmod(bin, 0o755)
+    // 启动器可能是上个用例留下的符号链接：先删掉，免得写穿到别处。
+    await rm(path.join(launcherHome, ".local", "bin", "opclaude"), { force: true })
+    return await install()
+  }
+  await install()
 
   const st = {
     mode: "proxy",
     port: "",
     ticket: "ticket-A-fake",
     device: "device-fake",
+    ccVersion: DEFAULT_CC_VERSION,
     delayMs: 0, // 响应头之前的延迟
     status: 200,
     redirect: 0,
@@ -136,8 +306,9 @@ export async function makeRig({ dir = "" } = {}) {
   const sync = async () => {
     for (const k of Object.keys(st)) await writeFile(path.join(state, k), String(st[k]))
   }
+  await sync()
 
-  const seen = { proxy: [], elsewhere: [], body: "" }
+  const seen = { proxy: [], elsewhere: [], body: "", ua: [], bodies: [] }
   let hits = 0
   const names = (req) => [...req.headers.keys()].map((k) => k.toLowerCase()).sort()
   let elsewhere, server
@@ -145,7 +316,9 @@ export async function makeRig({ dir = "" } = {}) {
     const url = new URL(req.url)
     const device = req.headers.get("x-opusclaude-device")
     const authed = req.headers.get("authorization") === `Bearer ${st.proxyTicket || st.ticket}`
-    seen.proxy.push({ method: req.method, path: url.pathname + url.search, headers: names(req), authed, device, app: req.headers.get("x-app"), model: "", port: server?.port })
+    const ua = req.headers.get("user-agent")
+    if (url.pathname !== "/v1/models") { seen.ua.push(ua); seen.bodies.push({ path: url.pathname + url.search, body: await req.text() }) }
+    seen.proxy.push({ method: req.method, path: url.pathname + url.search, headers: names(req), authed, device, app: req.headers.get("x-app"), ua, model: "", port: server?.port })
     if (st.redirect) return new Response(null, { status: 302, headers: { location: `http://127.0.0.1:${elsewhere.port}/stolen` } })
     if (!authed) {
       return new Response(JSON.stringify({ type: "error", error: { type: "authentication_error", message: "bad ticket, got " + (req.headers.get("authorization") ?? "") } }), {
@@ -173,12 +346,11 @@ export async function makeRig({ dir = "" } = {}) {
       Bun.write(path.join(dir, "hits"), String(hits))
     }
     if (url.pathname === "/v1/messages/count_tokens") {
-      const body = await req.text()
-      return Response.json({ input_tokens: body.length })
+      return Response.json({ input_tokens: seen.bodies.at(-1).body.length })
     }
     if (st.hang) return new Response(new ReadableStream({ start(c) { c.enqueue(encoder.encode("event: message_start\ndata: {}\n\n")) } }), { headers: { "content-type": "text/event-stream" } })
     if (url.pathname === "/v1/messages") {
-      seen.body = await req.text()
+      seen.body = seen.bodies.at(-1).body
       const body = JSON.parse(seen.body)
       if (st.delayMs) await Bun.sleep(st.delayMs)
       seen.proxy.at(-1).model = String(body.model)
@@ -234,6 +406,15 @@ export async function makeRig({ dir = "" } = {}) {
       await sync()
       return new Response("ok")
     }
+    // 只读：外部进程（真实 Magpie 沙箱验证）经此取走代理见过的生成类请求：路径、User-Agent、X-App、是否带了当次票据、正文。
+    // 同样只读：模型发现（GET /v1/models）见过的请求，用来核对它与生成类请求带同一套宿主机标识。
+    if (url.pathname === "/__seen/models") {
+      return Response.json(seen.proxy.filter((r) => r.path === "/v1/models").map((r) => ({ method: r.method, path: r.path, ua: r.ua, app: r.app, authed: r.authed })))
+    }
+    if (url.pathname === "/__seen") {
+      const gen = seen.proxy.filter((r) => r.path !== "/v1/models")
+      return Response.json(gen.map((r, i) => ({ method: r.method, path: r.path, ua: r.ua, app: r.app, authed: r.authed, body: seen.bodies[i]?.body ?? "" })))
+    }
       return new Response("nope", { status: 404 })
     },
   })
@@ -243,12 +424,26 @@ export async function makeRig({ dir = "" } = {}) {
   await sync()
 
   return {
-    dir, state, bin, st, seen, sync, fakeSource: FAKE, sse: SSE,
+    // 插件执行的是 opclauded 的物理路径（macOS 的 /var 是 /private/var 的符号链接）。
+    dir, state, bin, realBin: await realpath(bin), opusHome, realOpusHome: await realpath(opusHome), config, writeConfig, st, seen, sync, install, restore, fakeSource: FAKE, sse: SSE,
     ctlPort: ctl.port,
+    // 这套假安装对应的进程环境：HOME 是启动器所在的用户目录，不带 OPUSCLAUDE_HOME（走默认 ~/.opusclaude）。
+    get env() {
+      const env = { ...process.env, HOME: launcherHome }
+      delete env.OPUSCLAUDE_HOME
+      return env
+    },
+    launcher: path.join(launcherHome, ".local", "bin", "opclaude"),
+    // 插件查找启动器的位置（只供测试注入）：用户目录里的那份，加上沙箱里空的“/usr/local/bin”。
+    // 不注入时插件会去看运行测试的机器上真实的 /usr/local/bin/opclaude。
+    get dirs() { return [this.launcher, path.join(dir, "usr-local", "bin", "opclaude")] },
+    // 固定系统 Claude 路径的沙箱替身（只供测试注入）：避免碰到运行测试机器上的 /opt/homebrew/bin/claude 与 /usr/local/bin/claude。
+    get claudes() { return [...claudes] },
     /** 端口监听器：并发测试用它确认两个 rig 不会选中同一个端口。 */
     get listener() { return server },
     get port() { return server?.port ?? 0 },
-    opusHome: path.join(dir, "home"),
+    // dir 是“系统用户”的 home，dir/.opusclaude 是默认的 OpusClaude home（启动器里写死的 opclauded 在它之下）。
+    opusHome,
     elsewhereUrl: `http://127.0.0.1:${elsewhere.port}`,
     /** 代理重启到白名单内另一个当前能绑定的端口：先绑好新监听器，再切换并关掉旧的。返回新端口，绑不到返回 0。 */
     async rebindFree() {
