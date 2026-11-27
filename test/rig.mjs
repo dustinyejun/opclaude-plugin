@@ -28,6 +28,33 @@ if [ "$2" = --home ] && [ -d "$3" ]; then d="$(cd "$3/.." && pwd)/state"; fi
 # 自定位：从自己所在位置往上两级，与安装里 opclauded/<版本>/opclauded 的层次一致。
 _oc_l="$(cd "$(dirname "$0")/../.." && pwd)"; printf '%s\n' "\${_oc_l##*/}" > "$d/launched-layout"
 mode="$(cat "$d/mode" 2>/dev/null || echo proxy)"
+# 套餐状态：与官方 oc_plan_json proxy 同一调用（opclauded account，无参数，状态目录在 OPCLAUDE_PROXY_HOME）。
+# 插件运行的是内容绑定副本，位置不在安装里，所以运行态按代理状态目录往上两级找，找不到再按自己的位置往上三级。
+if [ "$1" = account ]; then
+  if [ -n "\${OPCLAUDE_PROXY_HOME:-}" ]; then
+    _oc_p="\${OPCLAUDE_PROXY_HOME%/}"; _oc_p="$(dirname "$(dirname "$_oc_p")")"
+    [ -f "$_oc_p/state/account" ] && d="$_oc_p/state"
+  fi
+  # 没有可用的状态目录时依次按自己的位置往上三级、按用户目录找（只为让故障注入有地方可记）。
+  if [ ! -f "$d/account" ]; then
+    _oc_b="$(cd "$(dirname "$0")/../../.." 2>/dev/null && pwd)" && [ -f "$_oc_b/state/account" ] && d="$_oc_b/state"
+  fi
+  if [ ! -f "$d/account" ]; then d="$HOME/state"; fi
+  printf '%s\n' "$*" > "$d/account-args"
+  printf '%s\n' "$0" > "$d/account-bin"
+  printf '%s\n' "\${OPCLAUDE_PROXY_HOME:-}" > "$d/account-proxy-home"
+  env | cut -d= -f1 | sort > "$d/account-env"
+  a="$(cat "$d/account" 2>/dev/null)"
+  case "$a" in
+    hang) exec sleep 30;;
+    fail) printf 'opclauded: account failed for /private/secret/state with sk-SECRETSTDERR123456\\n' >&2; exit 1;;
+    invalid) printf 'not json: %s /private/secret/state sk-SECRETSTDOUT123456\\n' "$d";;
+    none) exit 0;;
+    empty) : ;;
+    *) printf '%s\\n' "$a" ;;
+  esac
+  exit 0
+fi
 if [ "$1" != launch ] || [ "$2" != --home ] || [ "$4" != --min-protocol ] || [ "$5" != 1 ]; then
   printf 'usage\\n' >&2; exit 64
 fi
@@ -290,6 +317,8 @@ export async function makeRig({ dir = "", launcherHome = "", private: privateDir
     ticket: "ticket-A-fake",
     device: "device-fake",
     ccVersion: DEFAULT_CC_VERSION,
+    // opclauded account 的标准输出（account-status JSON）；hang / fail / invalid / none / empty 是故障注入
+    account: '{"ok":true,"plan_name":"Pro 周卡","weekly_pct":42.5}',
     delayMs: 0, // 响应头之前的延迟
     status: 200,
     redirect: 0,

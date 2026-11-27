@@ -62,6 +62,41 @@
 
 OpusClaude 后台按这个请求头如何记录或展示请求，只能在真实的订阅上确认，目前还没有验证（见「已知范围」）。
 
+### 套餐与周额度（Magpie 的「用量」）
+
+插件实现了 Magpie 自己的 `auth.usage` 钩子，所以 Magpie「用量」页里 OpusClaude 账号的额度卡片和 `magpie quota opclaude` 会显示：
+
+- 套餐名（`plan_name`）
+- 「本周额度」窗口的已用百分比（`weekly_pct`）。剩余由 Magpie 按已用算出，不是插件给出的
+- 套餐本周不限额度时（`weekly_unlimited`），窗口写的是「本周额度不限」，不给百分比。Magpie 0.1.4936 把这种只带 `display` 的窗口当文字窗口显示（`--json` 里标 `text: true`）；它在 `--json` 里同时补了 `used: 0` / `remaining: 100`，这是 Magpie 对文字窗口的统一处理，不是插件给出的读数
+
+数据来源只有一个：宿主机官方 `opclaude status` 查套餐时用的同一条命令，即 `opclauded account`（不带参数），读它标准输出上的 JSON。依据是官方安装脚本的 `oc_plan_json` / `oc_plan_print`。插件只读上面三个字段和 `ok`，不读钱包余额、到期时间，也不读 `message`。不需要填写任何新的凭据或选项。
+
+剩余百分比按 Magpie 的原生口径查看，各处显示的不一样：
+
+| 在哪里看 | 显示什么 |
+| --- | --- |
+| `magpie quota opclaude`（普通文本） | 套餐名和每个窗口的已用，取整到整数百分比，例如「本周额度 42%」。不列剩余 |
+| `magpie quota opclaude --json`、网关的 `GET /v1/magpie/quotas` | 每个窗口的 `used` 和 Magpie 推得的 `remaining`，例如 `42.5` 与 `57.5` |
+| Magpie「用量」页的账号卡片 | 默认是 Used（已用）；切到 Left 显示剩余 |
+
+| 情况 | Magpie 里看到的 |
+| --- | --- |
+| `weekly_pct` 是数字或数字字符串（含 `0`） | 套餐名，本周已用 N%；剩余为 100−N%，在 `--json`、额度 API 与页面的 Left 里查看 |
+| `weekly_unlimited` 为真 | 套餐名，「本周额度不限」 |
+| 有套餐名，但 `weekly_pct` 缺失或不是数字 | 只有套餐名。不填 0%，也不显示剩余 |
+| `ok` 为 `false`、命令退出码非零、超时、输出不是合法 JSON，或找不到宿主机安装 | 卡片上一句固定提示（见下表的 `account_*`），没有额度窗口。账号仍是已登录，请求照常可用 |
+
+几点约定：
+
+- **这个窗口只用于展示。** 插件把它标成 `aside: true`，Magpie 的路由不读它：即使显示已用 100%，Magpie 也不会因此停用账号或提前拦截请求，额度和余额续用由 OpusClaude 自己决定。Magpie 0.1.4936 的 `magpie quota --json` 和网关的 `GET /v1/magpie/quotas` 不回传 `aside` 字段，它在路由内部生效。
+- **本周已用不是现金余额。** 插件不填写 `balance`，卡片上不要把它当作钱包余量。
+- **和请求用同一个程序、同一份状态。** 查询执行的就是发请求时那一个 opclauded：默认流程下是启动器选定、核对过指纹的执行副本，旧的显式配置下是给出的那一个。代理状态目录与官方一致，默认流程和旧的显式配置走同一个优先级：插件选项里的 `proxyHome` > 宿主环境的 `OPCLAUDE_PROXY_HOME` > 不指定。不指定时，`launch` 不传这个变量（交给 opclauded 自己的默认值），`account` 按官方启动器的规则用 `<OpusClaude home>/proxy`。请求与额度查的是同一份状态：宿主环境或选项把代理目录指到别处时，两条路径一起改读那一处。这个 home 和请求路径用的是同一个确认过的物理目录：旧的显式 `opusHome` 里即使有符号链接后接 `..`，也按文件系统实际解析到的安装来取，不会落到另一个安装的状态目录。环境同样最小（`HOME`、`LANG`、`LC_ALL`、`TMPDIR`、`PATH`），不交出任何 `ANTHROPIC_*` 凭据，12 秒内有界。
+- **Magpie 保留上一次读到的套餐名。** 查询失败时卡片上可能仍是上次的套餐名，旁边是这次的提示。
+- 宿主进程设了 `OPUSCLAUDE_PROXY=0` 时和请求一样报 `proxy_disabled`。还没登录时不去探测宿主机。
+
+公开的安装脚本没有给出可用的重置时刻，所以窗口不带重置时间；`days_left` 只是近似天数，插件不采用。
+
 ## 前置条件
 
 1. 已按官方方式装好 OpusClaude，`opclaude` 能正常使用，本机代理处于开启状态。安装后 `opclaude version` 能在 `Claude Code：` 一行里显示版本号。显示“未找到”时，先把 Claude Code 装到 `opclaude` 能找到的位置。
@@ -172,6 +207,9 @@ Remote magpie 上的模型带远端名字前缀，这里是 `office/`。把 `off
 | `proxy_unreachable`、`redirect_refused` | 本机代理连不上，或者返回了跳转 |
 | `upstream_error` | 本机代理返回了错误，正文换成了固定文案。状态码和重试信息保留。正文带着票据或设备 ID、不是可识别的 JSON 错误、超过 64 KiB，或者 10 秒内读不完时，都会换成它 |
 | `models_failed`、`models_invalid` | `/v1/models` 失败或内容无法识别，Magpie 继续使用已有的模型清单 |
+| `account_unavailable`、`account_failed`、`account_timeout`、`account_aborted`、`account_output_invalid` | 只影响「用量」里的周额度显示：`opclauded account` 报告未成功、退出码非零、超时、被取消或输出无法识别。卡片上是一句固定提示，不影响请求，账号也不会被标成需要重新登录。定位宿主机时的错误（如 `launcher_not_found`、`proxy_disabled`）同样只显示为提示 |
+
+`auth.usage` 的失败只在额度卡片上显示，不进入请求路径。
 
 本机代理返回 401 时，插件附带 `X-Magpie-Sign-In: kept`。票据问题在 OpusClaude 一侧处理，Magpie 的登录状态保持不变。
 
@@ -186,10 +224,10 @@ export MAGPIE_BUN="$HOME/.cache/magpie/bun/1.4.5/magpie-bun"
 MAGPIE_BUN="$MAGPIE_BUN" python3 scripts/e2e-magpie.py
 ```
 
-- `test`：macOS 159 个用例 / Linux 160 个用例（含 Linux `/proc/<pid>/exe` 实进程检查，其中使用自有 157426 字节等尺寸离线夹具测试两阶段 `PATH`、候选顺序与 `PATH` 缺省/显式为空，并通过沙箱路径注入控制固定系统 Claude 候选），覆盖启动器的静态解析（含官方四种转义）与默认发现、启动器与所属安装的绑定、目录属主与权限的逐级核对与 `prot` 栈出栈、只执行核对过的字节与原子无覆盖复用、确认物理位置、`OPUSCLAUDE_HOME` 与两个官方代理变量、宿主机版本经 `stdin` 读取的只读 `TMPDIR` 兼容与整组清理、固定临时名被占用时多路并发原子收敛到同一回退根、定位失败不外传原始异常、三条出站路径的身份头、旧配置兼容（含非默认的显式 home），以及 launch 输出解析与协议校验、可执行文件校验、请求转发、`Request` 与 `init` 的原生合并、设备头、成功与失败响应的脱敏、失败响应的期限、模型发现的期限与大小上限、请求取消、SSE 工具事件拼接、401 处理、端点白名单与跳转、环境代理零命中、端口并发、Bun 版本守卫（含预发布版本）。
+- `test`：周额度加入之前 macOS 159 个用例 / Linux 160 个用例（含 Linux `/proc/<pid>/exe` 实进程检查，其中使用自有 157426 字节等尺寸离线夹具测试两阶段 `PATH`、候选顺序与 `PATH` 缺省/显式为空，并通过沙箱路径注入控制固定系统 Claude 候选），覆盖启动器的静态解析（含官方四种转义）与默认发现、启动器与所属安装的绑定、目录属主与权限的逐级核对与 `prot` 栈出栈、只执行核对过的字节与原子无覆盖复用、确认物理位置、`OPUSCLAUDE_HOME` 与两个官方代理变量、宿主机版本经 `stdin` 读取的只读 `TMPDIR` 兼容与整组清理、固定临时名被占用时多路并发原子收敛到同一回退根、定位失败不外传原始异常、三条出站路径的身份头、旧配置兼容（含非默认的显式 home），以及 launch 输出解析与协议校验、可执行文件校验、请求转发、`Request` 与 `init` 的原生合并、设备头、成功与失败响应的脱敏、失败响应的期限、模型发现的期限与大小上限、请求取消、SSE 工具事件拼接、401 处理、端点白名单与跳转、环境代理零命中、端口并发、Bun 版本守卫（含预发布版本），以及周额度（`test/account.test.mjs`，23 个用例：`account-status` JSON 的解析、已用 0 与不限套餐、缺失与非数字不填 0、`ok:false` / 非零退出 / 超时 / 非法输出的固定文案、自动发现与旧的显式路径、`proxyHome` 的取舍、代理禁用与未登录、带 `LC_ALL` 与不带 `LC_ALL` 的最小环境、显式 home 含符号链接后接 `..` 时的双账号回归（A 为 42.5%、B 为 95%：先确认折叠出的目录确实读到 B，再确认插件读到 A；宿主环境把请求与额度一起指向 B，选项再覆盖回 A）。加上周额度后 macOS 上是 182 个用例；Linux 上还没有重跑。
 - `scripts/verify-official-template.mjs` 按 SHA-256（`4371431b202dd47cce643ecade756f3524af55e123e55262431edff3db642be7`）核验外部官方启动器模板并用模拟安装对照。下方的断网容器分别验证固定系统位置为空和有已知 Claude 替身两种情况。
-- `scripts/check.mjs`：按 Magpie 加载插件的方式从目录加载，逐个检查各个钩子。整个检查在空的 `HOME` 下运行，不看这台机器上真实的 OpusClaude 安装；没有安装时，请求返回 `launcher_not_found`。
-- `scripts/e2e-magpie.py`：用本机的 Magpie CLI 与网关做端到端验证，68 项检查。它需要 `MAGPIE_BUN` 指向兼容的 Bun，默认使用 macOS 应用内的 Magpie CLI（其他安装方式用 `MAGPIE_BIN` 指定）。
+- `scripts/check.mjs`：按 Magpie 加载插件的方式从目录加载，逐个检查各个钩子，包括 `auth.usage`。整个检查在空的 `HOME` 下运行，不看这台机器上真实的 OpusClaude 安装；没有安装时，请求返回 `launcher_not_found`。
+- `scripts/e2e-magpie.py`：用本机的 Magpie CLI 与网关做端到端验证，86 项检查。它需要 `MAGPIE_BUN` 指向兼容的 Bun，默认使用 macOS 应用内的 Magpie CLI（其他安装方式用 `MAGPIE_BIN` 指定）。
 
 用更早的 Bun 运行时，这三条命令都会直接说明需要 Bun 1.4.3 或更高版本，然后以非零状态退出。
 
@@ -241,7 +279,7 @@ docker run --rm -v "$PWD":/w:ro -v "$HOME/.cache/linux-bun":/bun:ro debian:bookw
 
 `e2e-magpie.py` 起两套互相隔离的 Magpie。主机那套装了本插件和一套模拟安装：仿官方的 `opclaude` 启动器、假的 `claude`、假的 `opclauded`。另一套不装插件，经 Remote magpie 调用主机，相当于另一台机器。两个模拟客户端的自称版本（2.1.100 与 2.1.90）都与主机不同。
 
-`e2e-magpie.py` 在 Magpie 0.1.4781 上 68 项检查全部通过（改到 0.1.4781 之后连续 4 次都是 68 项；0.1.4779 上此前连续 10 次也是 68 项），结果如下：
+`e2e-magpie.py` 在 Magpie 0.1.4936 上 86 项检查全部通过，2026 年 11 月在 0.1.4938 上重跑也通过（原有的 68 项在 Magpie 0.1.4781 上通过；加上周额度与普通文本 CLI 的断言后在 0.1.4936、0.1.4938 上通过）。0.1.4938 上四次运行中有一次，原有的「旧的显式配置成对时可用」一项返回 404（网关一时不认识模型），紧接着重跑两次都通过，这一项与周额度无关，原因没有查清。结果如下：
 
 - 不设任何插件选项即可登录。登录不询问路径、密钥或版本，Magpie 的插件设置里只有插件目录
 - `magpie models` 列出来自模拟代理的模型
@@ -249,6 +287,10 @@ docker run --rm -v "$PWD":/w:ro -v "$HOME/.cache/linux-bun":/bun:ro debian:bookw
 - 网关把 `count_tokens` 交给插件，模拟代理返回 `input_tokens: 98`
 - 直连客户端的每一个生成类请求都带着主机的版本和 `X-App: cli`，客户端自己的版本没有到达代理
 - 模型发现（`GET /v1/models`）到达模拟代理时带的也是主机的版本和 `X-App: cli`，与生成类请求一致
+- 普通文本的 `magpie quota opclaude` 显示套餐与「本周额度 42%」（42.5 取整；Magpie 的普通文本只列已用）；`weekly_pct` 非数字时只有套餐，没有额度窗口行
+- `magpie quota opclaude --json` 和网关的 `GET /v1/magpie/quotas` 显示套餐与「本周额度」已用 42.5%、剩余 57.5%（剩余由 Magpie 按 used 算出）。查询执行的是核对过的执行副本，不带参数，代理状态目录是 `<home>/proxy`。零用量（数字字符串 `"0"`）显示已用 0%、剩余 100%；不限套餐显示「本周额度不限」而没有百分比；`weekly_pct` 非数字时只有套餐名
+- `opclauded account` 退出码非零、`ok:false`、输出不是 JSON 时，`magpie quota` 给出对应的固定提示和空的窗口，输出里没有模拟的密钥、状态目录路径或沙箱 home；账号仍是 `signed in`，下一条请求照常成功
+- 宿主环境设了 `OPCLAUDE_PROXY_HOME` 时，请求与周额度都从同一个代理状态目录读取；旧的显式配置成对时，周额度经显式给出的那个 opclauded 读取，代理目录的取舍（选项 > 宿主环境 > 默认）与默认流程相同
 - 宿主机升级（假的 `claude` 改报新版本）后，不重新登录，下一条请求即成功，请求头跟着变成新版本
 - 另一套 Magpie 经 Remote magpie 列出 `office/opclaude/…` 模型并发送成功。它的请求和 `count_tokens` 到达代理时带的仍是主机的版本。客户端版本不同，代理上看到的都只是主机当时的版本
 - 读不到宿主机版本时报 `version_unknown`，恢复后下一条请求成功
@@ -298,7 +340,7 @@ chmod go-w ~/.local ~/.local/bin ~/.local/bin/opclaude ~/.local/bin/claude ~/.op
 - 真实安装的 `opclaude version` 会在 OpusClaude home 下建 `claude-env` 目录。它不联网，但这是一次写入
 - 真实机器之间跨网络的 Remote magpie 链路（验证用的是同一台机器上的两套隔离 Magpie，回环地址）
 - `/v1/models` 的返回格式。已确认的只有 `data[].id`。`display_name` 和 `name` 是可选的兼容字段，插件读到时用作显示名。上下文长度、输出上限等能力字段尚未确认，所以插件不填写这些元数据
-- `opclauded account` 的输出格式，因此插件没有实现用量显示
+- 真实 `opclauded account` 的行为。周额度的字段依据是官方安装脚本的 `oc_plan_json` / `oc_plan_print`（`plan_name`、`weekly_pct`、`weekly_unlimited`、`ok`、`days_left`），只在按它写的模拟程序上验证过。插件按官方的调用方式不带参数，并把 `OPCLAUDE_PROXY_HOME` 设为显式值或 `<home>/proxy`；真实程序以内容绑定副本运行时能否据此找到现有代理的状态，还没有在真实安装上确认。真实输出若带有脚本没有展示的字段，插件也不会读取
 - 宿主机对 `127.0.0.1` 设置了代理时，需确认 `NO_PROXY` 放行回环地址
 
 本仓库不包含部署、推送或发布步骤。

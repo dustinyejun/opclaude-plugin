@@ -23,12 +23,12 @@ MAGPIE_BIN  magpie 可执行文件，默认 /Applications/magpie.app/Contents/Ma
 里面的 security 和 secret-tool 是无操作的替身，Magpie 子进程对钥匙串的调用不会落到系统工具上。
 沙箱里的进程都被告知一个环境代理，用来确认插件的请求不经过环境代理。
 """
-import contextlib, hashlib, json, os, pathlib, re, shutil, signal, socket, subprocess, sys, tempfile, threading, time, urllib.error, urllib.request
+import contextlib, hashlib, json, os, pathlib, re, shutil, signal, socket, subprocess, sys, tempfile, threading, time, urllib.error, urllib.parse, urllib.request
 
 HERE = pathlib.Path(__file__).resolve().parent.parent
 MAGPIE = os.environ.get("MAGPIE_BIN", "/Applications/magpie.app/Contents/MacOS/magpie")
 PLUGIN_DIR = str(HERE)
-SECRETS = ("ticket-A-fake", "device-fake", "sk-upstream-fake", "ticket-config-fake")
+SECRETS = ("ticket-A-fake", "device-fake", "sk-upstream-fake", "ticket-config-fake", "sk-SECRETSTDOUT123456", "sk-SECRETOK123456", "SECRETSTDERR", "/private/secret/state")
 HOST_CC = "2.1.284"          # 主机上假的 claude 一开始报的版本（state/ccVersion）
 HOST_CC_UPGRADED = "2.1.300"  # “宿主升级”之后
 CLIENT_A = "claude-cli/2.1.100 (external, cli)"   # 直连主机网关的客户端
@@ -300,6 +300,113 @@ with tempfile.TemporaryDirectory(prefix="opclaude-e2e-") as tmp, contextlib.Exit
           code == 200 and model in catalog and discovery and all(r["method"] == "GET" and r["ua"] == HOST_UA() and r["app"] == "cli" and r["authed"] for r in discovery),
           [(r["method"], r["ua"], r["app"], r["authed"]) for r in discovery][-4:])
 
+    # 2b. 周额度（auth.usage）：默认流程，来源是模拟 opclauded account 的只读 JSON。
+    #     account 的值经 mock 的管理入口改（set_mock 会把它重新落盘，所以不走 write_state）。
+    def set_account(value):
+        # 只改 account 并把 mock 内存里的状态落盘（不带参数时管理入口只落盘）
+        with opener.open(ctl + "/__ctl?account=" + urllib.parse.quote(value, safe=""), timeout=10) as r:
+            r.read()
+
+    def set_account_default():
+        set_account('{"ok":true,"plan_name":"Pro 周卡","weekly_pct":42.5}')
+
+    def quota_cli():
+        result = run(host_env, "quota", "opclaude", "--json", expect_ok=False)
+        return result, (result.stdout + result.stderr).strip()
+
+    def quotas_gateway():
+        code, _, body, _ = http(base, "/v1/magpie/quotas")
+        return code, json.loads(body) if code == 200 else body
+
+    def find_quota(node, **want):
+        # 在任意层级的 JSON 里找带指定键值的对象
+        if isinstance(node, dict):
+            if all(node.get(k) == v for k, v in want.items()):
+                return True
+            return any(find_quota(v, **want) for v in node.values())
+        if isinstance(node, list):
+            return any(find_quota(v, **want) for v in node)
+        return False
+
+    set_account_default()
+    result, text = quota_cli()
+    try:
+        parsed = json.loads(result.stdout)
+    except ValueError:
+        parsed = None
+    check("quota opclaude --json: plan and weekly used 42.5 / remaining 57.5 (remaining derived by Magpie)",
+          result.returncode == 0 and parsed is not None and find_quota(parsed, used=42.5, remaining=57.5) and "Pro 周卡" in text, f"exit {result.returncode} {text[-600:]}")
+    check("quota opclaude --json: the window is the weekly one", isinstance(parsed, (dict, list)) and find_quota(parsed, name="本周额度", used=42.5), text[-600:])
+    # 普通文本输出（不加 --json）：按 Magpie 的原生口径只列已用，不列剩余；剩余在 --json、额度 API 与页面 Left 里看。
+    plain = run(host_env, "quota", "opclaude", expect_ok=False)
+    check("plain magpie quota opclaude shows the plan and the used percentage (native text rounds 42.5 to 42%, lists used only)",
+          plain.returncode == 0 and "Pro 周卡" in plain.stdout and re.search(r"本周额度\s*42\s*%", plain.stdout) is not None and "57.5" not in plain.stdout,
+          f"exit {plain.returncode} {plain.stdout.strip()[-300:]!r}")
+    account_bin = (host_home / "state" / "account-bin").read_text().strip()
+    check("quota: opclauded account ran as the verified bound copy, with no arguments and the official default proxy state dir",
+          account_bin != cfg["opclauded"] and os.path.basename(account_bin) == "opclauded" and ".plugin-bin-" in account_bin
+          and (host_home / "state" / "account-args").read_text().strip() == "account"
+          and (host_home / "state" / "account-proxy-home").read_text().strip() == str(pathlib.Path(host_home / ".opusclaude" / "proxy").resolve()),
+          f"bin={account_bin} args={(host_home / 'state' / 'account-args').read_text().strip()!r} proxy-home={(host_home / 'state' / 'account-proxy-home').read_text().strip()!r}")
+    code, quotas = quotas_gateway()
+    # Magpie 0.1.4936 的 CLI 与网关不回传 aside 字段（它只在路由内部生效）；aside 由 Bun 测试对钩子返回值断言。
+    check("gateway GET /v1/magpie/quotas: plan and weekly used 42.5 / remaining 57.5",
+          code == 200 and find_quota(quotas, name="本周额度", used=42.5) and find_quota(quotas, remaining=57.5), f"{code} {json.dumps(quotas, ensure_ascii=False)[-700:]}")
+    set_account('{"ok":true,"plan_name":"Zero 套餐","weekly_pct":"0"}')
+    result, text = quota_cli()
+    try:
+        parsed = json.loads(result.stdout)
+    except ValueError:
+        parsed = None
+    check("quota: zero usage is valid (used 0 / remaining 100), not treated as unknown", result.returncode == 0 and parsed is not None and find_quota(parsed, used=0, remaining=100), f"exit {result.returncode} {text[-400:]}")
+    set_account('{"ok":true,"plan_name":"Max 套餐","weekly_unlimited":true}')
+    result, text = quota_cli()
+    try:
+        unlimited_windows = [w for q in json.loads(result.stdout) for w in q.get("windows", [])]
+    except (ValueError, AttributeError, TypeError):
+        unlimited_windows = None
+    # Magpie 0.1.4936 对只带 display 的窗口在 --json 里补 used: 0 / remaining: 100，并标 text: true（按文字显示）；
+    # 插件自己给出的窗口没有 used，这一点由 Bun 测试对钩子的返回值断言。这里确认 Magpie 把它当作文字窗口。
+    check("quota: unlimited weekly plan is shown as a text window (本周额度不限)",
+          result.returncode == 0 and "本周额度不限" in text and "Max 套餐" in text and len(unlimited_windows) == 1
+          and unlimited_windows[0].get("name") == "本周额度" and unlimited_windows[0].get("display") == "本周额度不限" and unlimited_windows[0].get("text") is True,
+          f"exit {result.returncode} {unlimited_windows!r}")
+    set_account('{"ok":true,"plan_name":"Pro 周卡","weekly_pct":"n/a"}')
+    result, text = quota_cli()
+    # 只看标准输出里 opclaude 这一项的 JSON：不扫描标准错误（Magpie 的日志里有临时路径、时间戳等数字）。
+    try:
+        missing = [q for q in json.loads(result.stdout) if q.get("provider") == "opclaude"]
+    except (ValueError, AttributeError, TypeError):
+        missing = None
+    check("quota: non-numeric usage shows the plan and no window (never a made-up 0%)",
+          result.returncode == 0 and missing is not None and len(missing) == 1 and missing[0].get("plan") == "Pro 周卡" and missing[0].get("windows") == [] and "error" not in missing[0],
+          f"exit {result.returncode} {missing!r}")
+    plain = run(host_env, "quota", "opclaude", expect_ok=False)
+    check("plain magpie quota opclaude with a missing weekly value: the plan only, no weekly window line",
+          plain.returncode == 0 and "Pro 周卡" in plain.stdout and "本周额度" not in plain.stdout, f"exit {plain.returncode} {plain.stdout.strip()[-300:]!r}")
+    for label, value, hint in (("account exits non-zero", "fail", "套餐状态查询失败"), ("ok:false", '{"ok":false,"message":"gone sk-SECRETOK123456"}', "暂时查不到"), ("output is not JSON", "invalid", "无法识别")):
+        set_account(value)
+        before = hits()
+        result, text = quota_cli()
+        listed = run(host_env, "plugin").stdout
+        try:
+            reading = json.loads(result.stdout)[0]
+        except (ValueError, IndexError, KeyError, TypeError):
+            reading = {}
+        # Magpie 保留上次读到的套餐名；这里只看它这次的 error 与窗口。路径和敏感值的检查只针对 CLI 的标准输出
+        # （标准错误里有 Magpie 自己打印的宿主环境日志）。
+        shown = [hint in reading.get("error", ""), reading.get("windows") == [], hint in result.stdout, str(host_home) not in result.stdout, "SECRET" not in result.stdout, "opclaude" in listed, "signed in" in listed]
+        check(f"quota: {label}: fixed safe text, empty windows, no raw output or path, account still signed in",
+              all(shown), f"exit {result.returncode} {shown} {reading.get('error')!r}")
+        set_account_default()
+        code, _, body, _ = http(base, "/v1/messages", {**prompt, "max_tokens": 16}, headers={"User-Agent": CLIENT_A, "X-App": "cli"})
+        check(f"quota: {label}: next request still succeeds", code == 200 and hits() == before + 1, f"{code} {body[:160]}")
+    set_account_default()
+    result, text = quota_cli()
+    check("quota: back to a normal reading after the failures", "Pro 周卡" in text and "42.5" in text, text[-400:])
+    # 上面的额度读取不产生生成类请求；后面按“第 2 步之后”的请求计数，这里重新取基线。
+    first = seen()
+
     # 3. 宿主升级：假的 claude 改报新版本，不重新登录、不重启
     write_state("ccVersion", HOST_CC_UPGRADED)
     marker = f"body-marker-{os.getpid()}"
@@ -422,6 +529,10 @@ with tempfile.TemporaryDirectory(prefix="opclaude-e2e-") as tmp, contextlib.Exit
     env_names = [(host_home / ".opusclaude" / "launcher-env").read_text().split() + (host_home / "state" / "claude-env").read_text().split()]
     check("host environment OPCLAUDE_PROXY_HOME: the request succeeds and opclauded alone receives it",
           code == 200 and delivered == str(proxy_state), f"{code} delivered={delivered!r} want={str(proxy_state)!r}")
+    run(proxy_home_env, "quota", "opclaude", "--json")
+    check("host environment OPCLAUDE_PROXY_HOME: request (launch) and weekly quota (account) both read that same proxy state dir",
+          (host_home / "state" / "account-proxy-home").read_text().strip() == str(proxy_state) and "Pro 周卡" in (host_home / "state" / "account").read_text(),
+          (host_home / "state" / "account-proxy-home").read_text().strip())
     check("host environment OPCLAUDE_PROXY_HOME: the launcher and claude never see it", "OPCLAUDE_PROXY_HOME" not in env_names, env_names)
     stop(server)
     server, gateway_log = managed(host_env, "gateway", [MAGPIE, "serve"])
@@ -459,6 +570,9 @@ with tempfile.TemporaryDirectory(prefix="opclaude-e2e-") as tmp, contextlib.Exit
     code, _, body, _ = http(base, "/v1/messages", body_prompt, headers={"User-Agent": CLIENT_A, "X-App": "cli"})
     check("a complete legacy pair keeps working (explicit path, host version from the launcher)", code == 200, f"{code} {body[:160]}")
     check("legacy pair: the User-Agent is still the host version", seen()[-1]["ua"] == HOST_UA(HOST_CC_UPGRADED), seen()[-1]["ua"])
+    run(host_env, "quota", "opclaude", "--json")
+    check("legacy pair: the quota is read through the explicitly given opclauded",
+          (host_home / "state" / "account-bin").read_text().strip() == cfg["opclauded"], (host_home / "state" / "account-bin").read_text().strip())
     run(host_env, "plugin", "options", spec, "off")
     run(host_env, "plugin", "login", "opclaude", text_in="local-marker\n")
     code, _, body, _ = http(base, "/v1/messages", body_prompt, headers={"User-Agent": CLIENT_A, "X-App": "cli"})

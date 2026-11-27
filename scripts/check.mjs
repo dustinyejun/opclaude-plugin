@@ -52,6 +52,7 @@ try {
   else ok("auth.provider = opclaude")
   if (hooks.provider?.id !== "opclaude") fail("provider.id 应为 opclaude")
   if (typeof hooks.auth?.loader !== "function") fail("缺少 auth.loader")
+  if (typeof hooks.auth?.usage !== "function") fail("缺少 auth.usage")
   if (typeof hooks.provider?.models !== "function") fail("缺少 provider.models")
   const method = hooks.auth?.methods?.[0]
   if (!method) fail("缺少登录方式")
@@ -107,6 +108,35 @@ try {
     const tail = rig.seen.proxy.slice(-2)
     if (countTokens.status === 200 && Object.keys(catalog).length > 0 && tail.every((r) => r.ua === ua && r.app === "cli" && r.authed) && tail.at(-1).path === "/v1/models") ok("count_tokens 与 GET /v1/models 也带宿主机版本头与 cli")
     else fail(`count_tokens / 模型发现应带宿主机版本头，实际 ${JSON.stringify(tail)}`)
+
+    // 周额度（auth.usage）：来自模拟 opclauded account 的只读 JSON，窗口只用于展示（aside）。
+    const usageOf = (p) => p.auth.usage(async () => ({ type: "api", key: signedIn.key }))
+    const quota = await usageOf(loaded)
+    if (JSON.stringify(quota) === JSON.stringify({ plan: "Pro 周卡", windows: [{ name: "本周额度", used: 42.5, aside: true }] })) ok("auth.usage：套餐 Pro 周卡，本周额度已用 42.5（aside，不参与路由）")
+    else fail(`auth.usage 应给出套餐与周已用，实际 ${JSON.stringify(quota)}`)
+    rig.st.account = '{"ok":true,"plan_name":"Max","weekly_unlimited":true}'
+    await rig.sync()
+    const unlimited = await usageOf(loaded)
+    if (unlimited.windows?.[0]?.display === "本周额度不限" && unlimited.windows[0].aside === true && unlimited.windows[0].used === undefined) ok("auth.usage：不限套餐用 display 明示，没有百分比")
+    else fail(`不限套餐应显示本周额度不限，实际 ${JSON.stringify(unlimited)}`)
+    rig.st.account = '{"ok":true,"plan_name":"Zero","weekly_pct":"0"}'
+    await rig.sync()
+    const zero = await usageOf(loaded)
+    if (zero.windows?.[0]?.used === 0) ok("auth.usage：零用量有效（数字字符串 0）")
+    else fail(`零用量应显示 used 0，实际 ${JSON.stringify(zero)}`)
+    rig.st.account = "fail"
+    await rig.sync()
+    const broken = await usageOf(loaded)
+    if (broken.error?.includes("套餐状态查询失败") && broken.signIn === "kept" && broken.windows.length === 0 && !JSON.stringify(broken).includes(rig.state)) ok("auth.usage：查询失败时返回固定文案，signIn 保持 kept")
+    else fail(`查询失败应返回固定文案，实际 ${JSON.stringify(broken)}`)
+    rig.st.account = '{"ok":true,"plan_name":"Pro 周卡","weekly_pct":42.5}'
+    await rig.sync()
+    const legacyUsage = await createPlugin({ opclauded: rig.bin, opusHome: rig.opusHome }, { env: rig.env, launcherDirs: rig.dirs, systemClaudes: rig.claudes }).auth.usage(async () => undefined)
+    if (legacyUsage.windows?.[0]?.used === 42.5 && (await Bun.file(path.join(rig.state, "account-bin")).text()).trim() === rig.bin) ok("auth.usage：旧的显式配置按显式路径查询")
+    else fail(`旧的显式配置应按显式路径查询，实际 ${JSON.stringify(legacyUsage)}`)
+    const off = await createPlugin({}, { env: { ...rig.env, OPUSCLAUDE_PROXY: "0" }, launcherDirs: rig.dirs, systemClaudes: rig.claudes }).auth.usage(async () => signedIn)
+    if (off.error?.includes("本机代理未启用") && off.signIn === "kept") ok("auth.usage：代理禁用时返回 proxy_disabled 的固定文案")
+    else fail(`代理禁用时应返回固定文案，实际 ${JSON.stringify(off)}`)
   } finally {
     await rig.close()
   }
